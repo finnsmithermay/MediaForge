@@ -1,0 +1,327 @@
+  CHAPTERS 3 & 4 — FULL REQUEST FLOW DIAGRAM
+=============================================
+
+This builds on chapter 3. Chapter 4 adds DynamoDB (the database) to persist jobs.
+Before chapter 4, uploads were "fire and forget" — now they're saved and queryable.
+
+
+WHAT CHANGED IN CHAPTER 4
+==========================
+
+Before (Ch 3):  Upload file → store in S3 → return response → job data is lost
+After  (Ch 4):  Upload file → store in S3 → save job to DynamoDB → return response
+                 Now you can GET /jobs and GET /jobs/{id} and get real data back.
+
+New pieces:
+  - store.JobStore interface (internal/api/store/store.go)
+  - DynamoDBStore implementation (internal/api/store/dynamodb.go)
+  - DynamoDB table "mediaforge-jobs" running in LocalStack
+  - main.go now creates the DynamoDBStore and passes it to the Server
+
+
+STARTUP (runs once when you do `make dev`)
+==========================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  cmd/server/main.go — main() runs top to bottom, ONE TIME              │
+│                                                                         │
+│  1. ctx := context.Background()                                         │
+│                                                                         │
+│  2. s3Cfg := storage.Config{...}                                        │
+│     storageClient, err := storage.NewS3Client(ctx, s3Cfg)               │
+│     → configures the AWS SDK for S3, returns *S3Client                  │
+│     → points at LocalStack (localhost:4566) with fake creds             │
+│                                                                         │
+│  3. dynamoCfg := store.DynamoDBConfig{...}          ← NEW IN CHAPTER 4 │
+│     jobStore, err := store.NewDynamoDBStore(ctx, dynamoCfg)             │
+│     → configures the AWS SDK for DynamoDB                               │
+│     → same idea as S3: points at LocalStack, fake creds                 │
+│     → returns a *DynamoDBStore (holds the client + table name)          │
+│                                                                         │
+│  4. server := api.NewServer(storageClient, jobStore)                    │
+│     → creates the Server struct, stores BOTH clients inside it:         │
+│       Server {                                                          │
+│           storage: storageClient,  ← for S3 (file storage)             │
+│           store:   jobStore,       ← for DynamoDB (job database)       │
+│       }                                                                 │
+│     → sets up all routes                                                │
+│                                                                         │
+│  5. http.ListenAndServe(":8080", server.Router())                       │
+│     → BLOCKS HERE FOREVER, waiting for requests                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+UPLOAD REQUEST (POST /api/v1/upload)
+====================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  YOU: curl -X POST localhost:8080/api/v1/upload -F "file=@photo.jpg"    │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Middleware stack (same as Ch 3)                                         │
+│  RequestID → RealIP → Logger → Recoverer → CORS                        │
+│  Then route match: POST /api/v1/upload → handleUpload()                 │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  handleUpload() — internal/api/handlers.go                              │
+│                                                                         │
+│  Steps 1-6: SAME AS CHAPTER 3                                           │
+│    Parse file, detect media type, generate jobID, build S3 key          │
+│                                                                         │
+│  Step 7: s.storage.Upload(ctx, s3Key, file, contentType)                │
+│    → uploads file to S3 (same as before)                                │
+│                                                                         │
+│  Step 8: s.storage.GetURL(ctx, s3Key)                                   │
+│    → generates presigned download URL (same as before)                  │
+│                                                                         │
+│  Step 9: Build the Job struct:                          NEW IN CH 4     │
+│    job := &models.Job{                                                  │
+│        ID:          "9e4edd29-3b88-...",                                 │
+│        FileName:    "photo.jpg",                                        │
+│        MediaType:   "image",                                            │
+│        Status:      "pending",                                          │
+│        OriginalURL: "http://localhost:4566/...",                         │
+│        CreatedAt:   time.Now(),                                         │
+│        UpdatedAt:   time.Now(),                                         │
+│    }                                                                    │
+│                                                                         │
+│  Step 10: s.store.Create(ctx, job) ─────────────────── NEW IN CH 4     │
+│    → saves the job to DynamoDB                                          │
+│    → s.store is the JobStore interface                                  │
+│    → the real object behind it is *DynamoDBStore                        │
+│                                                                         │
+│  Step 11: Return JSON response to curl                                  │
+│    {"job_id":"9e4edd29-...","status":"pending","message":"..."}         │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  │  s.store.Create(ctx, job)
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  store.JobStore (INTERFACE) — internal/api/store/store.go               │
+│                                                                         │
+│  Same idea as storage.Client — a contract, not running code:            │
+│                                                                         │
+│  Create(ctx, job) → error         "save a new job"                      │
+│  Get(ctx, id) → (*Job, error)     "fetch one job by ID"                 │
+│  Update(ctx, job) → error         "update an existing job"              │
+│  List(ctx, limit) → ([]Job, err)  "get recent jobs"                     │
+│                                                                         │
+│  The handler doesn't know or care that DynamoDB is behind this.         │
+│  It just says "save this job" and trusts the interface.                 │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  DynamoDBStore.Create() — internal/api/store/dynamodb.go                │
+│                                                                         │
+│  func (s *DynamoDBStore) Create(ctx, job) error {                       │
+│                                                                         │
+│    1. attributevalue.MarshalMap(job)                                     │
+│       → converts the Go struct into a DynamoDB-formatted map            │
+│       → uses the `dynamodbav` tags on the struct fields:                │
+│         ID string `dynamodbav:"id"` → {"id": {"S": "9e4edd29-..."}}    │
+│                                                                         │
+│    2. s.client.PutItem(ctx, &dynamodb.PutItemInput{                     │
+│           TableName: "mediaforge-jobs",                                  │
+│           Item:      item,  ← the marshaled map                         │
+│       })                                                                 │
+│       → s.client is the AWS SDK's *dynamodb.Client                      │
+│       → sends a PutItem request to LocalStack                           │
+│  }                                                                       │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  AWS SDK (dynamodb.Client) — written by Amazon, imported via go.mod     │
+│                                                                         │
+│  PutItem():                                                              │
+│    → builds an HTTP POST request with the item data as JSON             │
+│    → signs it with credentials ("test"/"test")                          │
+│    → sends to endpoint: http://localhost:4566                            │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  LocalStack (Docker, port 4566) — DynamoDB service                      │
+│                                                                         │
+│  Receives: PutItem on table "mediaforge-jobs"                           │
+│    → stores the item in its local database                              │
+│    → responds with HTTP 200 OK                                          │
+│    → the job is now persisted — you can query it later                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+GET JOB REQUEST (GET /api/v1/jobs/{id}) — NEW IN CHAPTER 4
+==========================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  YOU: curl http://localhost:8080/api/v1/jobs/9e4edd29-3b88-...          │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  handleGetJob() — internal/api/handlers.go                              │
+│                                                                         │
+│  1. jobID := chi.URLParam(r, "id")                                      │
+│     → extracts "9e4edd29-3b88-..." from the URL                        │
+│                                                                         │
+│  2. job, err := s.store.Get(ctx, jobID)                                 │
+│     → calls DynamoDBStore.Get()                                         │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  DynamoDBStore.Get() — internal/api/store/dynamodb.go                   │
+│                                                                         │
+│  1. Builds a GetItemInput with:                                          │
+│     - TableName: "mediaforge-jobs"                                      │
+│     - Key: {"id": {"S": "9e4edd29-3b88-..."}}                          │
+│                                                                         │
+│  2. s.client.GetItem(ctx, input)                                        │
+│     → AWS SDK sends request to LocalStack                               │
+│     → LocalStack looks up the item by ID, returns it                    │
+│                                                                         │
+│  3. attributevalue.UnmarshalMap(output.Item, &job)                      │
+│     → converts DynamoDB format back into a models.Job struct            │
+│                                                                         │
+│  4. Returns &job to the handler                                         │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Back in handleGetJob():                                                 │
+│                                                                         │
+│  writeJSON(w, http.StatusOK, job)                                       │
+│  → serializes the Job struct to JSON and sends it back to curl          │
+│                                                                         │
+│  You see:                                                                │
+│  {"id":"9e4edd29-...","file_name":"photo.jpg","status":"pending",...}   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+LIST JOBS REQUEST (GET /api/v1/jobs) — NEW IN CHAPTER 4
+=======================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  YOU: curl http://localhost:8080/api/v1/jobs                             │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  handleListJobs() → s.store.List(ctx, limit)                            │
+│                                                                         │
+│  DynamoDBStore.List():                                                   │
+│    1. s.client.Scan(ctx, &ScanInput{TableName: "mediaforge-jobs"})      │
+│       → Scan = "give me everything in the table" (up to limit)          │
+│       → LocalStack returns all items                                    │
+│                                                                         │
+│    2. Loop through results, UnmarshalMap each one into a models.Job     │
+│                                                                         │
+│    3. Return the slice of Jobs                                          │
+│                                                                         │
+│  Handler returns:                                                        │
+│  {"jobs":[{...},{...}],"total_count":2}                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+HOW THE PIECES FIT TOGETHER
+============================
+
+┌──────────────┐         ┌──────────────┐         ┌──────────────────┐
+│              │         │              │         │                  │
+│   Handlers   │────────▶│  Interfaces  │────────▶│  Implementations │
+│ (handlers.go)│         │              │         │                  │
+│              │         │              │         │                  │
+└──────────────┘         └──────────────┘         └──────────────────┘
+
+  s.storage.Upload()  →  storage.Client    →  S3Client → LocalStack S3
+  s.store.Create()    →  store.JobStore    →  DynamoDBStore → LocalStack DynamoDB
+
+The handlers only talk to interfaces. They never import or reference S3Client
+or DynamoDBStore directly. This means:
+  - You can swap implementations without touching handler code
+  - You can write tests with fake/mock implementations
+  - Each layer has one job and doesn't know about the others
+
+
+WHAT'S STORED WHERE
+===================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  LocalStack (Docker container on port 4566)                             │
+│                                                                         │
+│  ┌─────────────────────────────────────────┐                            │
+│  │  S3 Bucket: "mediaforge-uploads"        │                            │
+│  │                                         │                            │
+│  │  originals/9e4edd29-3b88-...png  ← the actual file bytes            │
+│  │  originals/abc123-def456-...jpg  ← another upload                   │
+│  └─────────────────────────────────────────┘                            │
+│                                                                         │
+│  ┌─────────────────────────────────────────┐                            │
+│  │  DynamoDB Table: "mediaforge-jobs"      │  ← NEW IN CHAPTER 4       │
+│  │                                         │                            │
+│  │  {id: "9e4edd29-...",                   │                            │
+│  │   file_name: "Testing.png",             │                            │
+│  │   media_type: "image",                  │                            │
+│  │   status: "pending",                    │  ← metadata about the job │
+│  │   original_url: "http://...",           │                            │
+│  │   created_at: "2026-08-05T..."}         │                            │
+│  └─────────────────────────────────────────┘                            │
+│                                                                         │
+│  S3 stores the FILE. DynamoDB stores INFO ABOUT the file (the job).    │
+│  They're linked by the jobID — the S3 key contains the same ID.        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+STARTUP SUMMARY
+===============
+
+| When        | What                                           | How often     |
+|-------------|------------------------------------------------|---------------|
+| Startup     | NewS3Client() — configure S3 connection        | Once          |
+| Startup     | NewDynamoDBStore() — configure DynamoDB conn.  | Once (Ch 4)   |
+| Startup     | NewServer(storage, store) — wire everything up | Once          |
+| Startup     | ListenAndServe — start listening                | Once (blocks) |
+| Per request | handleUpload() — store file + save job record  | Every upload  |
+| Per request | handleGetJob() — fetch job from DynamoDB       | Every GET     |
+| Per request | handleListJobs() — scan all jobs from DynamoDB | Every list    |
+
+
+
+
+Here's a more simple flow for the SQS and S3 confusion
+
+  FULL FLOW:
+
+  1. Upload file                → S3 (the actual file bytes)
+  2. Create job record          → DynamoDB (status: "pending", no metadata yet)
+  3. Push jobID to queue        → SQS
+
+  4. Worker picks up message    ← SQS
+  5. Worker fetches job info    ← DynamoDB (to know which file, where it is)
+  6. Worker downloads file      ← S3
+  7. Worker processes it        (extracts metadata, generates thumbnail)
+  8. Worker uploads thumbnail   → S3 (a new file)
+  9. Worker updates job record  → DynamoDB (status: "complete", adds metadata + thumbnail URL)
+
+  So the answers:
+
+  ┌───────────────────────────────────────┬──────────┬───────────────────────────────────────────────────────┐
+  │                Result                 │ Goes to  │                          Why                          │
+  ├───────────────────────────────────────┼──────────┼───────────────────────────────────────────────────────┤
+  │ Thumbnail                             │ S3       │ It's a file (image bytes), S3 stores files            │
+  ├───────────────────────────────────────┼──────────┼───────────────────────────────────────────────────────┤
+  │ Metadata (width, height, codec, etc.) │ DynamoDB │ It's data about the job, gets added to the job record │
+  └───────────────────────────────────────┴──────────┴───────────────────────────────────────────────────────┘
+
+  Look at your models.Job struct — the fields are already there waiting to be filled in:
+
+  ThumbnailURL string    `json:"thumbnail_url,omitempty"`    // ← worker fills this
+  Metadata     *Metadata `json:"metadata,omitempty"`         // ← worker fills this
+  Status       JobStatus `json:"status"`                     // ← worker changes to "complete"
+
+  After processing, the worker calls s.store.Update(ctx, job) to write those fields back to DynamoDB. Then when you GET /api/v1/jobs/{id}, you see the complete job with thumbnail URL and metadata.

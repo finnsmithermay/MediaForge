@@ -1,0 +1,173 @@
+CHAPTER 3 — REQUEST FLOW DIAGRAM
+==================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  YOU (terminal 1)                                                       │
+│                                                                         │
+│  make dev                                                               │
+│  → runs: AWS_ENDPOINT=http://localhost:4566 go run cmd/server/main.go   │
+│  → this compiles and starts your program                                │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  cmd/server/main.go — main() runs top to bottom, ONE TIME at startup    │
+│                                                                         │
+│  1. ctx := context.Background()                                         │
+│     → creates a base context (used for cancellation later)              │
+│                                                                         │
+│  2. s3Cfg := storage.Config{                                            │
+│         Bucket:   "mediaforge-uploads",                                 │
+│         Region:   "us-east-1",                                          │
+│         Endpoint: "http://localhost:4566",  ← from AWS_ENDPOINT env var │
+│         URLExpiry: 15 * time.Minute,                                    │
+│     }                                                                   │
+│     → just packs your settings into a struct, nothing happens yet       │
+│                                                                         │
+│  3. storageClient, err := storage.NewS3Client(ctx, s3Cfg)               │
+│     → calls the constructor in internal/storage/s3.go                   │
+│     → this is where the AWS SDK gets configured (region, creds,         │
+│       endpoint) and returns a ready-to-use *S3Client                    │
+│     → if it fails, program exits                                        │
+│                                                                         │
+│  4. server := api.NewServer(storageClient)                              │
+│     → creates the Server struct, stores the S3Client inside it          │
+│     → sets up all the routes (which URL → which handler)                │
+│                                                                         │
+│  5. http.ListenAndServe(":8080", server.Router())                       │
+│     → starts listening for HTTP requests on port 8080                   │
+│     → BLOCKS HERE FOREVER — waiting for requests                        │
+│     → the program never passes this line until you hit Ctrl+C           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+         ... server is now sitting idle, waiting ...
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  YOU (terminal 2)                                                       │
+│                                                                         │
+│  curl -X POST localhost:8080/api/v1/upload -F "file=@photo.jpg"         │
+│  → sends an HTTP request to port 8080 on your machine                   │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  internal/api/router.go — setupRoutes()                                 │
+│                                                                         │
+│  The request hits the middleware stack (top to bottom):                  │
+│    → RequestID: assigns a unique ID to this request                     │
+│    → RealIP: notes the client's IP address                              │
+│    → Logger: starts a timer (will log duration when done)               │
+│    → Recoverer: wraps everything in panic protection                    │
+│    → corsMiddleware: adds CORS headers                                  │
+│                                                                         │
+│  Then matches the URL:                                                  │
+│    POST /api/v1/upload → s.handleUpload                                 │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  internal/api/handlers.go — handleUpload()                              │
+│                                                                         │
+│  1. r.Body = http.MaxBytesReader(w, r.Body, 100<<20)                    │
+│     → wraps request body with a 100MB limit                             │
+│                                                                         │
+│  2. r.ParseMultipartForm(32 << 20)                                      │
+│     → parses the uploaded file data from the HTTP request               │
+│     → keeps up to 32MB in RAM, rest goes to temp file                   │
+│                                                                         │
+│  3. file, header, err := r.FormFile("file")                             │
+│     → gets the actual file data (as an io.Reader)                       │
+│     → header has the filename, content type                             │
+│                                                                         │
+│  4. mediaType, err := detectMediaType(contentType, header.Filename)     │
+│     → checks if it's "video" or "image" based on extension/content type │
+│                                                                         │
+│  5. jobID := uuid.New().String()                                        │
+│     → generates a random unique ID like "c061fe6f-572f-490e-..."        │
+│                                                                         │
+│  6. s3Key := fmt.Sprintf("originals/%s%s", jobID, ext)                  │
+│     → builds the storage path: "originals/c061fe6f-572f...jpg"          │
+│                                                                         │
+│  7. s.storage.Upload(r.Context(), s3Key, file, contentType) ────────┐   │
+│     → s.storage is the interface                                    │   │
+│     → the actual object behind it is the *S3Client from startup     │   │
+│                                                                     │   │
+│  8. s.storage.GetURL(r.Context(), s3Key) ───────────────────────────┤   │
+│     → generates a presigned download URL                            │   │
+│                                                                     │   │
+│  9. Returns JSON to curl:                                           │   │
+│     {"job_id":"c061fe6f-...","status":"pending","message":"..."}    │   │
+└─────────────────────────────────────────────────────────────────────┼───┘
+                                                                      │
+                         ┌────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  storage.Client (INTERFACE)                                             │
+│                                                                         │
+│  This is NOT code that runs. It's a contract:                           │
+│  "anything passed around as storage.Client must have these methods"     │
+│                                                                         │
+│  Upload(ctx, key, body, contentType) → (string, error)                  │
+│  GetURL(ctx, key) → (string, error)                                     │
+│  Download(ctx, key) → (io.ReadCloser, error)                            │
+│                                                                         │
+│  The handler calls s.storage.Upload() without knowing what's behind it. │
+│  At runtime, it's the *S3Client — but the handler doesn't import,       │
+│  reference, or depend on that concrete type.                            │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  internal/storage/s3.go — S3Client.Upload()                             │
+│                                                                         │
+│  func (c *S3Client) Upload(ctx, key, body, contentType) {               │
+│      input := &s3.PutObjectInput{                                       │
+│          Bucket:      "mediaforge-uploads",  ← from c.bucket            │
+│          Key:         "originals/c061fe6f...jpg",                        │
+│          Body:        file,  ← the io.Reader, streams bytes             │
+│          ContentType: "image/jpeg",                                      │
+│      }                                                                   │
+│      c.client.PutObject(ctx, input)                                     │
+│      → c.client is the AWS SDK's *s3.Client                             │
+│      → calls PutObject on it, which builds and sends the HTTP request   │
+│  }                                                                       │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  AWS SDK (s3.Client) — code written by Amazon, you imported it          │
+│                                                                         │
+│  PutObject():                                                           │
+│    → reads bytes from the io.Reader in small chunks                     │
+│    → builds an HTTP PUT request                                         │
+│    → signs it with credentials ("test"/"test" for LocalStack)           │
+│    → sends it to the endpoint: http://localhost:4566                     │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  LocalStack (Docker container, port 4566)                               │
+│                                                                         │
+│  Receives: PUT /mediaforge-uploads/originals/c061fe6f...jpg             │
+│    → stores the file bytes in the container's filesystem                │
+│    → responds with HTTP 200 OK                                          │
+│    → the SDK gets the response, returns nil error to your Upload()      │
+│    → your Upload() returns nil error to handleUpload()                  │
+│    → handleUpload() continues to step 8 (GetURL)                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+WHAT HAPPENS AT STARTUP VS PER-REQUEST
+=======================================
+
+| When        | What                                          | How often           |
+|-------------|-----------------------------------------------|---------------------|
+| Startup     | NewS3Client() — configure SDK, create client  | Once                |
+| Startup     | NewServer(storageClient) — set up routes      | Once                |
+| Startup     | ListenAndServe — start listening              | Once (blocks)       |
+| Per request | handleUpload() — parse file, call Upload/URL  | Every time someone  |
+|             |                                               | sends a request     |
+
+The S3Client is created once and reused for every request. It holds a pool of HTTP
+connections to LocalStack that it reuses rather than opening a new connection each time.
